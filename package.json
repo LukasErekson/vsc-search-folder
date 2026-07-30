@@ -1,0 +1,98 @@
+{
+  "name": "search-folder",
+  "displayName": "Search Folder",
+  "description": "Search for folders in your workspace and reveal them in the Explorer sidebar with fuzzy matching, just like Go to File…",
+  "version": "1.0.0",
+  "publisher": "vibe-coded",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/search-folder"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "folder",
+    "search",
+    "reveal",
+    "explorer",
+    "navigate",
+    "fuzzy"
+  ],
+  "activationEvents": [
+    "onCommand:searchFolder.goToFolder",
+    "onExplorerContext:searchFolder"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "searchFolder.goToFolder",
+        "title": "Search Folder: Go to Folder…"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "when": "explorerResourceIsFolder",
+          "command": "searchFolder.goToFolder",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Search Folder",
+      "properties": {
+        "searchFolder.excludePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "node_modules",
+            ".git",
+            ".svn",
+            "__pycache__",
+            ".next",
+            "dist",
+            "build",
+            "target",
+            "vendor",
+            ".tox",
+            ".venv",
+            "env",
+            ".env"
+          ],
+          "description": "Glob patterns for folders to exclude from search results."
+        },
+        "searchFolder.maxResults": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum number of folder results to show in the quick pick list."
+        },
+        "searchFolder.fuzzyThreshold": {
+          "type": "number",
+          "default": 0.4,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fuzzy matching sensitivity. 0 = exact match only, 1 = matches everything."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.5.0"
+  }
+}
