@@ -5,21 +5,23 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 // ---------------------------------------------------------------------------
-// State
+// Types
 // ---------------------------------------------------------------------------
-
-/**
- * Cache of folder names → full paths, populated as we walk the tree.
- * Cleared when the user runs the command (stale entries are fine because we
- * re-scan the tree each time).
- */
-let folderCache: FolderEntry[] | null = null;
 
 interface FolderEntry {
   /** Basename of the folder (e.g. "src"). */
   name: string;
   /** Absolute filesystem path. */
   fullPath: string;
+}
+
+interface ScoredEntry {
+  /** Display path relative to workspace root (for the quick-pick label). */
+  displayPath: string;
+  /** Full absolute filesystem path. */
+  fullPath: string;
+  /** Fuzzy score (higher = better match). */
+  score: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,19 +39,16 @@ export function deactivate(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Command handler
+// Command handler  (live QuickPick version)
 // ---------------------------------------------------------------------------
 
 async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
-  // Determine the root folder to search under.
+  // ── 1. Determine root folder ──────────────────────────────────────────
   let rootUri: vscode.Uri;
 
   if (uri) {
-    // Invoked from the explorer context menu on a folder – search under that
-    // folder.
     rootUri = uri;
   } else {
-    // Invoked from the command palette – use the first workspace folder.
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
       vscode.window.showErrorMessage('Search Folder: No workspace folder is open.');
@@ -58,62 +57,131 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
     rootUri = folders[0].uri;
   }
 
-  // Ask the user what to search for.
-  const query = await vscode.window.showInputBox({
-    placeHolder: 'Type a folder name to search…',
-    prompt: `Searching under: ${vscode.workspace.asRelativePath(rootUri, false) || rootUri.fsPath}`,
-    ignoreFocusOut: true,
-  });
+  const rootFsPath = rootUri.fsPath;
+  const rootLabel =
+    vscode.workspace.asRelativePath(rootUri, false) || rootFsPath;
 
-  if (!query || query.trim().length === 0) {
-    return; // user cancelled
-  }
+  // ── 2. Create QuickPick (appears immediately) ────────────────────────
+  const picker = vscode.window.createQuickPick();
+  picker.placeholder = `Search folders under ${rootLabel}…`;
+  picker.ignoreFocusOut = true;
+  picker.busy = true; // spinner while tree loads
+  picker.show();
 
-  const normalizedQuery = query.trim();
+  // ── 3. Walk the tree in the background ────────────────────────────────
+  let allEntries: FolderEntry[] | null = null;
+  let walkCancelled = false;
 
-  // Walk the tree with progress.
-  const matched = await vscode.window.withProgress<ScoredEntry[]>(
+  const walkPromise = vscode.window.withProgress<FolderEntry[]>(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Searching folders matching "${normalizedQuery}"…`,
+      title: `Walking folder tree under ${rootLabel}…`,
       cancellable: true,
     },
-    async (progress, token) => {
-      const entries = await walkTree(rootUri.fsPath, token);
-      if (token.isCancellationRequested) {
-        return [];
-      }
-      const scored = scoreEntries(normalizedQuery, entries);
-      return scored;
+    async (_progress, token) => {
+      token.onCancellationRequested(() => {
+        walkCancelled = true;
+      });
+      const entries = await walkTree(rootFsPath, token);
+      return entries;
     },
   );
 
-  if (!matched || matched.length === 0) {
-    vscode.window.showInformationMessage(`No folders matched "${normalizedQuery}".`);
+  // When the tree walk finishes, store results and un-busy the picker.
+  walkPromise.then(
+    (entries) => {
+      if (walkCancelled) {
+        picker.items = [{ label: '(walk cancelled)', kind: vscode.QuickPickItemKind.Separator }];
+        return;
+      }
+      allEntries = entries;
+      picker.busy = false;
+
+      // If the user already typed something, apply it now.
+      if (picker.value.trim().length > 0) {
+        updateResults(picker, picker.value, allEntries);
+      }
+    },
+    (err) => {
+      // Walk threw an unexpected error.
+      picker.busy = false;
+      picker.items = [
+        { label: `Error: ${err.message}`, kind: vscode.QuickPickItemKind.Separator },
+      ];
+    },
+  );
+
+  // ── 4. Debounced live filtering on each keystroke ────────────────────
+  let debounceTimer: NodeJS.Timeout | undefined;
+
+  picker.onDidChangeValue((value) => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = undefined;
+    }
+
+    if (!allEntries) {
+      return; // tree still loading – wait
+    }
+
+    if (value.trim().length === 0) {
+      picker.items = [];
+      return;
+    }
+
+    // 120 ms debounce feels snappy.
+    debounceTimer = setTimeout(() => {
+      updateResults(picker, value, allEntries!);
+    }, 120);
+  });
+
+  // ── 5. On selection  →  reveal in Explorer ───────────────────────────
+  picker.onDidAccept(() => {
+    const selected = picker.selectedItems[0];
+    if (!selected || !selected.detail) {
+      return;
+    }
+    const targetUri = vscode.Uri.file(selected.detail);
+    vscode.commands.executeCommand('revealInExplorer', targetUri);
+    picker.hide();
+  });
+
+  // ── 6. Clean-up on dismiss ───────────────────────────────────────────
+  picker.onDidHide(() => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+    walkCancelled = true;
+    picker.dispose();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Build QuickPick items from scratch
+// ---------------------------------------------------------------------------
+
+function updateResults(
+  picker: vscode.QuickPick<vscode.QuickPickItem>,
+  query: string,
+  entries: FolderEntry[],
+): void {
+  const scored = scoreEntries(query, entries);
+
+  if (scored.length === 0) {
+    picker.items = [
+      {
+        label: `No folders matched "${query}"`,
+        kind: vscode.QuickPickItemKind.Separator,
+      },
+    ];
     return;
   }
 
-  // Show the quick-pick list.
-  const picks: vscode.QuickPickItem[] = matched.map((entry) => ({
+  picker.items = scored.map((entry) => ({
     label: entry.displayPath,
-    description: '', // we show the full path in the detail/label
+    description: '',
     detail: entry.fullPath,
   }));
-
-  const selected = await vscode.window.showQuickPick(picks, {
-    placeHolder: `Select a folder (${matched.length} matched)`,
-    matchOnDescription: false,
-    matchOnDetail: false,
-    ignoreFocusOut: true,
-  });
-
-  if (!selected) {
-    return; // user cancelled
-  }
-
-  // Reveal the selected folder in the Explorer sidebar.
-  const targetUri = vscode.Uri.file(selected.detail!);
-  await vscode.commands.executeCommand('revealInExplorer', targetUri);
 }
 
 // ---------------------------------------------------------------------------
