@@ -135,15 +135,15 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
     }, 120);
   });
 
-  // ── 5. On selection  →  reveal in Explorer ───────────────────────────
+  // ── 5. On selection  →  reveal + expand in Explorer ──────────────────
   picker.onDidAccept(() => {
     const selected = picker.selectedItems[0];
     if (!selected || !selected.detail) {
       return;
     }
     const targetUri = vscode.Uri.file(selected.detail);
-    vscode.commands.executeCommand('revealInExplorer', targetUri);
     picker.hide();
+    void revealAndExpandInExplorer(targetUri);
   });
 
   // ── 6. Clean-up on dismiss ───────────────────────────────────────────
@@ -159,6 +159,20 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
 // ---------------------------------------------------------------------------
 // Build QuickPick items from scratch
 // ---------------------------------------------------------------------------
+
+/**
+ * Reveals `uri` in the Explorer and expands the folder so its children are
+ * visible.
+ *
+ * `revealInExplorer` only opens the Explorer, reveals + selects the folder
+ * (expanding its ancestors) and focuses the tree. The built-in `list.expand`
+ * command then expands the focused folder itself, which is the extra step
+ * that makes the folder's contents visible.
+ */
+async function revealAndExpandInExplorer(uri: vscode.Uri): Promise<void> {
+  await vscode.commands.executeCommand('revealInExplorer', uri);
+  await vscode.commands.executeCommand('list.expand');
+}
 
 function updateResults(
   picker: vscode.QuickPick<vscode.QuickPickItem>,
@@ -271,17 +285,23 @@ interface ScoredEntry {
  * Score every entry against `query` using a fuzzy algorithm that mirrors
  * VS Code's Quick Open behaviour:
  *
- *  1. Characters of `query` must appear **in order** in the folder name.
- *  2. Matches are scored higher when they are:
+ *  1. Characters of `query` must appear **in order** in the folder path
+ *     (relative to the workspace root), so nested directories can be matched,
+ *     e.g. `Models/Nomination` matches `Library/Models/Nomination`.
+ *  2. `/` and `\` are interchangeable in the query and the matched paths, so
+ *     the same query works on Linux and Windows.
+ *  3. Matches are scored higher when they are:
  *      - consecutive
  *      - at word boundaries (camelCase, kebab-case, snake_case)
- *      - at the beginning of the folder name
- *      - in shorter folder names (closer to query length)
+ *      - at the beginning of the folder path
+ *      - in shorter folder paths (closer to query length)
  *
  * Returns entries sorted by score descending, capped at `maxResults`.
  */
 function scoreEntries(query: string, entries: FolderEntry[]): ScoredEntry[] {
-  const lowerQuery = query.toLowerCase();
+  // Normalise separators so "Models/Nomination" and "Models\Nomination"
+  // behave identically on every platform.
+  const lowerQuery = query.toLowerCase().replace(/\\/g, '/');
   const workspaceRoot = vscode.workspace.rootPath || '';
   const threshold: number =
     vscode.workspace.getConfiguration('searchFolder').get('fuzzyThreshold', 0.4);
@@ -291,10 +311,15 @@ function scoreEntries(query: string, entries: FolderEntry[]): ScoredEntry[] {
   const scored: ScoredEntry[] = [];
 
   for (const entry of entries) {
-    const score = fuzzyScore(lowerQuery, entry.name.toLowerCase(), entry.name, threshold);
+    // Match against the full path relative to the workspace root (with '/'
+    // separators) instead of just the basename, so queries like
+    // "Models/Nomination" can match "Library/Models/Nomination".
+    const relativePath = path.relative(workspaceRoot, entry.fullPath) || entry.fullPath;
+    const normalizedPath = relativePath.replace(/\\/g, '/');
+    const score = fuzzyScore(lowerQuery, normalizedPath.toLowerCase(), normalizedPath, threshold);
     if (score > 0) {
       scored.push({
-        displayPath: path.relative(workspaceRoot, entry.fullPath) || entry.fullPath,
+        displayPath: normalizedPath,
         fullPath: entry.fullPath,
         score,
       });
@@ -315,9 +340,9 @@ function scoreEntries(query: string, entries: FolderEntry[]): ScoredEntry[] {
  * Scoring breakdown (cumulative, higher is better):
  *  - +20 per consecutive matched character
  *  - +15 per word-boundary match (uppercase after lowercase, or after _ / - / . / space)
- *  - +10 per match at the very start of the name
- *  - +5  per match after a path separator (/ or \)
- *  - Length bonus: up to +10 bonus when name length ≈ query length
+ *  - +10 per match at the very start of the path
+ *  - +10 per match after a path separator (/ or \)
+ *  - Length bonus: up to +15 bonus when path length ≈ query length
  */
 function fuzzyScore(
   lowerQuery: string,
