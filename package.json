@@ -2,12 +2,12 @@
   "name": "search-folder",
   "displayName": "Search Folder",
   "description": "Search for folders in your workspace and reveal them in the Explorer sidebar with fuzzy matching, just like Go to File…",
-  "version": "1.0.0",
-  "publisher": "vibe-coded",
+  "version": "0.1.2",
+  "publisher": "Lukas Erekson",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/search-folder"
+    "url": "https://github.com/LukasErekson/search-folder"
   },
   "engines": {
     "vscode": "^1.85.0"
