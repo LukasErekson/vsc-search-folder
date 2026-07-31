@@ -3,7 +3,7 @@
   "displayName": "Search Folder",
   "description": "Search for folders in your workspace and reveal them in the Explorer sidebar with fuzzy matching, just like Go to File…",
   "version": "0.1.2",
-  "publisher": "Lukas Erekson",
+  "publisher": "LukasErekson",
   "license": "MIT",
   "repository": {
     "type": "git",
