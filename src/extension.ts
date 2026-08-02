@@ -16,7 +16,7 @@ interface FolderEntry {
 }
 
 interface ScoredEntry {
-  /** Display path relative to workspace root (for the quick-pick label). */
+  /** Display path relative to the search root (for the quick-pick label). */
   displayPath: string;
   /** Full absolute filesystem path. */
   fullPath: string;
@@ -71,6 +71,7 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
   // ── 3. Walk the tree in the background ────────────────────────────────
   let allEntries: FolderEntry[] | null = null;
   let walkCancelled = false;
+  let disposed = false; // set once the picker has been hidden/disposed
 
   const walkPromise = vscode.window.withProgress<FolderEntry[]>(
     {
@@ -82,31 +83,39 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
       token.onCancellationRequested(() => {
         walkCancelled = true;
       });
-      const entries = await walkTree(rootFsPath, token);
-      return entries;
+      return walkTree(rootFsPath, token);
     },
   );
 
   // When the tree walk finishes, store results and un-busy the picker.
   walkPromise.then(
     (entries) => {
+      if (disposed) {
+        return; // picker already closed – nothing to update
+      }
       if (walkCancelled) {
         picker.items = [{ label: '(walk cancelled)', kind: vscode.QuickPickItemKind.Separator }];
         return;
       }
-      allEntries = entries;
+      // Include the search root itself so it can be selected and revealed too
+      // (e.g. after right-clicking a folder and searching under it).
+      allEntries = [{ name: path.basename(rootFsPath), fullPath: rootFsPath }, ...entries];
       picker.busy = false;
 
       // If the user already typed something, apply it now.
       if (picker.value.trim().length > 0) {
-        updateResults(picker, picker.value, allEntries);
+        updateResults(picker, picker.value, allEntries, rootFsPath);
       }
     },
     (err) => {
       // Walk threw an unexpected error.
+      if (disposed) {
+        return;
+      }
       picker.busy = false;
+      const message = err instanceof Error ? err.message : String(err);
       picker.items = [
-        { label: `Error: ${err.message}`, kind: vscode.QuickPickItemKind.Separator },
+        { label: `Error: ${message}`, kind: vscode.QuickPickItemKind.Separator },
       ];
     },
   );
@@ -131,7 +140,7 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
 
     // 120 ms debounce feels snappy.
     debounceTimer = setTimeout(() => {
-      updateResults(picker, value, allEntries!);
+      updateResults(picker, value, allEntries!, rootFsPath);
     }, 120);
   });
 
@@ -152,6 +161,7 @@ async function goToFolderHandler(uri?: vscode.Uri): Promise<void> {
       clearTimeout(debounceTimer);
     }
     walkCancelled = true;
+    disposed = true;
     picker.dispose();
   });
 }
@@ -178,8 +188,9 @@ function updateResults(
   picker: vscode.QuickPick<vscode.QuickPickItem>,
   query: string,
   entries: FolderEntry[],
+  displayRoot: string,
 ): void {
-  const scored = scoreEntries(query, entries);
+  const scored = scoreEntries(query, entries, displayRoot);
 
   if (scored.length === 0) {
     picker.items = [
@@ -203,8 +214,19 @@ function updateResults(
 // ---------------------------------------------------------------------------
 
 /**
- * Recursively walk the directory tree under `root`, returning every folder
- * as a flat list. Skips excluded patterns.
+ * Yield to the event loop after this many directories, so the QuickPick keeps
+ * processing keystrokes and cancellations even on very large trees.
+ */
+const WALK_YIELD_EVERY = 50;
+
+/**
+ * Recursively walk the directory tree under `root`, returning every folder as
+ * a flat list.
+ *
+ * Uses async directory reads so the extension host stays responsive on large
+ * trees, and skips symbolic links entirely so a symlink cycle cannot hang the
+ * walk. Folders whose basename matches `searchFolder.excludePatterns` are
+ * skipped along with their whole subtree.
  */
 async function walkTree(root: string, token: vscode.CancellationToken): Promise<FolderEntry[]> {
   const excludePatterns: string[] =
@@ -226,6 +248,7 @@ async function walkTree(root: string, token: vscode.CancellationToken): Promise<
 
   const entries: FolderEntry[] = [];
   const pending: string[] = [root];
+  let visited = 0;
 
   while (pending.length > 0) {
     if (token.isCancellationRequested) {
@@ -234,34 +257,35 @@ async function walkTree(root: string, token: vscode.CancellationToken): Promise<
 
     const dir = pending.pop()!;
 
-    // Skip if the basename matches an exclusion pattern (simple basename
-    // match – not full glob, but fast and catches 99 % of cases).
-    const base = path.basename(dir);
-    if (dir !== root && excludePatterns.some((p) => base === p)) {
-      continue;
-    }
-
-    let children: string[];
+    let children: fs.Dirent[];
     try {
-      children = fs.readdirSync(dir);
+      children = await fs.promises.readdir(dir, { withFileTypes: true });
     } catch {
       // Permission denied, ENOENT, etc. – skip silently.
       continue;
     }
 
     for (const child of children) {
-      const full = path.join(dir, child);
-      let stat: fs.Stats;
-      try {
-        stat = fs.statSync(full);
-      } catch {
+      // `withFileTypes` dirents don't follow symlinks, so a symlink pointing
+      // at an ancestor can't loop; skipping them keeps the walk terminating.
+      if (child.isSymbolicLink()) {
         continue;
       }
-
-      if (stat.isDirectory()) {
-        entries.push({ name: child, fullPath: full });
+      if (child.isDirectory()) {
+        // Skip excluded folders entirely (exact basename match – not full
+        // glob, but fast and catches 99 % of cases), pruning the subtree.
+        if (excludePatterns.some((p) => child.name === p)) {
+          continue;
+        }
+        const full = path.join(dir, child.name);
+        entries.push({ name: child.name, fullPath: full });
         pending.push(full);
       }
+    }
+
+    visited++;
+    if (visited % WALK_YIELD_EVERY === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 
@@ -272,21 +296,26 @@ async function walkTree(root: string, token: vscode.CancellationToken): Promise<
 // Fuzzy scoring
 // ---------------------------------------------------------------------------
 
-interface ScoredEntry {
-  /** Display path relative to workspace root (for the quick-pick label). */
-  displayPath: string;
-  /** Full absolute filesystem path. */
-  fullPath: string;
-  /** Fuzzy score (higher = better match). */
-  score: number;
-}
+// Scoring weights for `fuzzyScore` (higher is better). Tune these together;
+// the JSDoc on `fuzzyScore` documents how they combine.
+const CONSECUTIVE_BONUS = 20; // per consecutive matched character
+const WORD_BOUNDARY_BONUS = 15; // match after _ - . / space
+const START_OF_NAME_BONUS = 10; // match at the very start of the path
+const EXACT_START_BONUS = 30; // contiguous match starting at position 0
+const PATH_SEPARATOR_BONUS = 10; // match right after a / or \
+const SHORT_NAME_RATIO = 2; // length bonus kicks in below this ratio (exact branch)
+const SHORT_NAME_BONUS = 20; // max length bonus (exact branch)
+const FUZZY_SHORT_NAME_RATIO = 2.5; // length bonus kicks in below this ratio (fuzzy branch)
+const FUZZY_SHORT_NAME_BONUS = 15; // max length bonus (fuzzy branch)
+const UNMATCHED_CHAR_PENALTY = 2; // penalty per unmatched character (fuzzy branch)
+const THRESHOLD_SCALE = 50; // maps the 0–1 config threshold onto raw score space
 
 /**
  * Score every entry against `query` using a fuzzy algorithm that mirrors
  * VS Code's Quick Open behaviour:
  *
  *  1. Characters of `query` must appear **in order** in the folder path
- *     (relative to the workspace root), so nested directories can be matched,
+ *     (relative to `displayRoot`), so nested directories can be matched,
  *     e.g. `Models/Nomination` matches `Library/Models/Nomination`.
  *  2. `/` and `\` are interchangeable in the query and the matched paths, so
  *     the same query works on Linux and Windows.
@@ -298,11 +327,10 @@ interface ScoredEntry {
  *
  * Returns entries sorted by score descending, capped at `maxResults`.
  */
-function scoreEntries(query: string, entries: FolderEntry[]): ScoredEntry[] {
+function scoreEntries(query: string, entries: FolderEntry[], displayRoot: string): ScoredEntry[] {
   // Normalise separators so "Models/Nomination" and "Models\Nomination"
   // behave identically on every platform.
   const lowerQuery = query.toLowerCase().replace(/\\/g, '/');
-  const workspaceRoot = vscode.workspace.rootPath || '';
   const threshold: number =
     vscode.workspace.getConfiguration('searchFolder').get('fuzzyThreshold', 0.4);
   const maxResults: number =
@@ -311,11 +339,13 @@ function scoreEntries(query: string, entries: FolderEntry[]): ScoredEntry[] {
   const scored: ScoredEntry[] = [];
 
   for (const entry of entries) {
-    // Match against the full path relative to the workspace root (with '/'
+    // Match against the full path relative to the search root (with '/'
     // separators) instead of just the basename, so queries like
-    // "Models/Nomination" can match "Library/Models/Nomination".
-    const relativePath = path.relative(workspaceRoot, entry.fullPath) || entry.fullPath;
-    const normalizedPath = relativePath.replace(/\\/g, '/');
+    // "Models/Nomination" can match "Library/Models/Nomination". The search
+    // root itself is shown by its basename.
+    const relativePath = path.relative(displayRoot, entry.fullPath);
+    const displayPath = relativePath || path.basename(entry.fullPath);
+    const normalizedPath = displayPath.replace(/\\/g, '/');
     const score = fuzzyScore(lowerQuery, normalizedPath.toLowerCase(), normalizedPath, threshold);
     if (score > 0) {
       scored.push({
@@ -359,21 +389,21 @@ function fuzzyScore(
   const exactIdx = lowerName.indexOf(lowerQuery);
   if (exactIdx >= 0) {
     // Base score: contiguous match.
-    let baseScore = lowerQuery.length * 20;
+    let baseScore = lowerQuery.length * CONSECUTIVE_BONUS;
     // Bonus if it starts at a word boundary.
     if (exactIdx === 0) {
-      baseScore += 30; // starts at beginning of name
+      baseScore += EXACT_START_BONUS; // starts at beginning of name
     } else {
       const prev = originalName[exactIdx - 1];
       if (isWordBoundary(prev)) {
-        baseScore += 15;
+        baseScore += WORD_BOUNDARY_BONUS;
       }
     }
     // Penalty proportional to how much longer the name is than the query
     // (shorter names get a bonus).
     const lengthRatio = lowerName.length / Math.max(lowerQuery.length, 1);
-    if (lengthRatio < 2) {
-      baseScore += Math.round((1 - lengthRatio / 2) * 20);
+    if (lengthRatio < SHORT_NAME_RATIO) {
+      baseScore += Math.round((1 - lengthRatio / SHORT_NAME_RATIO) * SHORT_NAME_BONUS);
     }
     return Math.max(baseScore, 1);
   }
@@ -391,18 +421,18 @@ function fuzzyScore(
       consecutive++;
 
       // Consecutive bonus.
-      score += consecutive * 20;
+      score += consecutive * CONSECUTIVE_BONUS;
 
       // Word-boundary bonus.
       if (ni === 0) {
-        score += 10; // start of name
+        score += START_OF_NAME_BONUS; // start of name
       } else if (isWordBoundary(originalName[ni - 1])) {
-        score += 15;
+        score += WORD_BOUNDARY_BONUS;
       }
 
       // Path-separator bonus.
       if (ni > 0 && (originalName[ni - 1] === '/' || originalName[ni - 1] === '\\')) {
-        score += 10;
+        score += PATH_SEPARATOR_BONUS;
       }
     } else {
       consecutive = 0;
@@ -416,19 +446,19 @@ function fuzzyScore(
 
   // Penalty for unmatched characters in the name (spread penalty).
   const unusedChars = lowerName.length - totalMatched;
-  score -= unusedChars * 2;
+  score -= unusedChars * UNMATCHED_CHAR_PENALTY;
 
   // Length bonus (prefer names closer to query length).
   const lengthRatio = lowerName.length / Math.max(lowerQuery.length, 1);
-  if (lengthRatio < 2.5) {
-    score += Math.round((1 - lengthRatio / 2.5) * 15);
+  if (lengthRatio < FUZZY_SHORT_NAME_RATIO) {
+    score += Math.round((1 - lengthRatio / FUZZY_SHORT_NAME_RATIO) * FUZZY_SHORT_NAME_BONUS);
   }
 
   // Normalise so scores are comparable across different query lengths.
   const normalised = score / Math.max(lowerQuery.length, 1);
 
   // Apply the user-configurable threshold.
-  if (normalised < threshold * 50) {
+  if (normalised < threshold * THRESHOLD_SCALE) {
     return -1;
   }
 
