@@ -23,10 +23,6 @@
     "navigate",
     "fuzzy"
   ],
-  "activationEvents": [
-    "onCommand:searchFolder.goToFolder",
-    "onExplorerContext:searchFolder"
-  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -88,11 +84,17 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "lint": "eslint src test",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test 'test/**/*.test.ts'",
     "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
-    "typescript": "^5.5.0"
+    "@vscode/vsce": "^3.9.2",
+    "eslint": "^10.8.0",
+    "globals": "^17.9.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.65.0"
   }
 }

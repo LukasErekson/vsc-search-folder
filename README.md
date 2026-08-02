@@ -46,7 +46,9 @@ The extension walks your workspace directory tree and scores each folder name us
 
 ```bash
 npm install
-npm run compile
+npm run compile    # TypeScript → out/
+npm run lint       # ESLint
+npm test           # unit tests (node:test)
 npm run package    # produces search-folder-1.0.0.vsix
 ```
 
